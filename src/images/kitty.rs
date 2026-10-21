@@ -18,6 +18,7 @@ use image::{DynamicImage, ImageFormat};
 /// Escape sequences have a maximum length, so the payload is chunked. Chunks
 /// must be a multiple of 4 bytes so that base64 quanta are never split.
 const CHUNK: usize = 4096;
+const BELOW_CELL_BACKGROUNDS: i32 = i32::MIN;
 
 /// Encodes an image for display at `cols` x `rows` cells.
 pub fn encode(image: &DynamicImage, cols: u16, rows: u16, id: u32) -> Option<String> {
@@ -90,9 +91,10 @@ pub(crate) fn place(
     source_width: u32,
     source_height: u32,
 ) -> String {
-    // A negative z-index keeps terminal text and pager overlays above images.
+    // Values below INT32_MIN/2 put images beneath non-default cell backgrounds,
+    // so opaque overlays cover only the part of an image they intersect.
     format!(
-        "\x1b_Ga=p,i={image_id},p={placement_id},x=0,y={source_y},w={source_width},h={source_height},c={cols},r={rows},z=-1,C=1,q=2\x1b\\"
+        "\x1b_Ga=p,i={image_id},p={placement_id},x=0,y={source_y},w={source_width},h={source_height},c={cols},r={rows},z={BELOW_CELL_BACKGROUNDS},C=1,q=2\x1b\\"
     )
 }
 
@@ -160,6 +162,7 @@ mod tests {
         assert_eq!(keys["p"], "4");
         assert_eq!(keys["y"], "16");
         assert_eq!(keys["h"], "48");
+        assert_eq!(keys["z"], BELOW_CELL_BACKGROUNDS.to_string());
 
         let deletion = delete_placement(9, 4);
         let keys = parse_keys(&deletion);

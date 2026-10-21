@@ -863,10 +863,7 @@ impl Pager<'_> {
             writer.reset(&mut out);
         }
 
-        let placements = if self.settings.render.images
-            && self.has_images()
-            && !matches!(self.mode, Mode::Panel(_))
-        {
+        let placements = if self.settings.render.images && self.has_images() {
             self.draw_images(&mut out, height)
         } else {
             HashSet::new()

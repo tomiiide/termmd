@@ -204,6 +204,12 @@ impl Store {
         self.encoded.clear();
     }
 
+    pub fn invalidate(&mut self) {
+        self.decoded.clear();
+        self.encoded.clear();
+        self.kitty_images.clear();
+    }
+
     /// Loads an image, caching the outcome either way.
     fn load(&mut self, url: &str) -> Result<&Loaded, ImageProblem> {
         if !self.decoded.contains_key(url) {
@@ -784,6 +790,33 @@ mod tests {
             1,
             "decoded pixels survive invalidation"
         );
+    }
+
+    #[test]
+    fn invalidation_reloads_changed_images() {
+        let dir = std::env::temp_dir().join("termmd-test-invalidation");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("t.png"), test_png(8, 8)).unwrap();
+        let img = ImageRef {
+            url: "t.png".into(),
+            ..Default::default()
+        };
+        let mut store = store_with(GraphicsProtocol::Kitty, &dir);
+
+        assert_eq!(store.measure(&img), Some((8, 8)));
+        assert!(store.encode(ImageRequest::new(&img, 4, 2)).is_some());
+        assert!(
+            store
+                .kitty_place(ImageRequest::new(&img, 4, 2), 1)
+                .is_some()
+        );
+        std::fs::write(dir.join("t.png"), test_png(16, 8)).unwrap();
+        assert_eq!(store.measure(&img), Some((8, 8)));
+
+        store.invalidate();
+        assert!(store.encoded.is_empty());
+        assert!(store.kitty_images.is_empty());
+        assert_eq!(store.measure(&img), Some((16, 8)));
     }
 
     #[test]

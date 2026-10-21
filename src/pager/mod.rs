@@ -787,6 +787,7 @@ impl Pager<'_> {
         for source in &mut self.sources {
             source.reload()?;
         }
+        self.store.invalidate();
         self.document = build_document(&self.sources, self.settings.parse);
         self.relayout();
         self.message = Some("reloaded".into());

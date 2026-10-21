@@ -105,8 +105,11 @@ pub fn run(
     store: &mut Store,
     watch: bool,
 ) -> Result<()> {
+    let mut settings = settings.clone();
+    let (cols, rows) = (settings.caps.cols, settings.caps.rows);
+    fit_settings_to_terminal(&mut settings, cols, rows);
     let document = build_document(sources, settings.parse);
-    let screen = render(&document, settings, highlighter, store);
+    let screen = render(&document, &settings, highlighter, store);
 
     // `--pager` means the pager, even for a short document: the shortcut below
     // is a convenience for the automatic case, not an override of an explicit
@@ -183,6 +186,18 @@ fn render(
             highlighter,
         )
     }
+}
+
+fn fit_settings_to_terminal(settings: &mut Settings, cols: u16, rows: u16) {
+    // Start from the requested width so widening restores space lost to a
+    // narrower window instead of preserving the last clamped value.
+    let target = settings
+        .requested_width
+        .unwrap_or_else(|| (cols as usize).min(100));
+    settings.render.width = target.min(cols as usize).max(8);
+    settings.render.margin = settings.render.margin.min(settings.render.width / 4);
+    settings.caps.cols = cols;
+    settings.caps.rows = rows;
 }
 
 struct Pager<'a> {
@@ -735,21 +750,7 @@ impl Pager<'_> {
 
     /// Re-lays-out the document at the current size, without moving the reader.
     fn rebuild(&mut self) {
-        // Recompute from what was originally asked for, so widening the window
-        // gives the width back rather than keeping whatever the narrowest size
-        // left behind.
-        let target = self
-            .settings
-            .requested_width
-            .unwrap_or_else(|| (self.cols as usize).min(100));
-        self.settings.render.width = target.min(self.cols as usize).max(8);
-        self.settings.render.margin = self
-            .settings
-            .render
-            .margin
-            .min(self.settings.render.width / 4);
-        self.settings.caps.cols = self.cols;
-        self.settings.caps.rows = self.rows;
+        fit_settings_to_terminal(&mut self.settings, self.cols, self.rows);
         self.store.invalidate_encodings();
         self.screen = render(&self.document, &self.settings, self.highlighter, self.store);
         if let Some(old) = self.search.take() {
@@ -1375,6 +1376,17 @@ mod tests {
         p.document = crate::markdown::parse(markdown, Default::default());
         p.rebuild();
         p
+    }
+
+    #[test]
+    fn requested_width_is_clamped_to_the_terminal_from_the_first_layout() {
+        let mut p = pager(0, 25);
+        p.settings.requested_width = Some(500);
+        fit_settings_to_terminal(&mut p.settings, 80, 25);
+        assert_eq!(p.settings.render.width, 80);
+
+        fit_settings_to_terminal(&mut p.settings, 120, 25);
+        assert_eq!(p.settings.render.width, 120);
     }
 
     #[test]

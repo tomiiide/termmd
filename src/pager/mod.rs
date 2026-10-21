@@ -5,15 +5,14 @@
 //! something changes the layout -- a resize, a reload, toggling images -- which
 //! is what keeps scrolling instant on a large document.
 //!
-//! Images are the one part that cannot be handled by slicing lines, because an
-//! escape sequence draws a whole picture at once. Each frame therefore positions
-//! the cursor and re-emits the images that intersect the viewport, cropped to
-//! the rows that are actually visible, so a picture scrolls off the top edge a
-//! row at a time instead of vanishing.
+//! Images are the one part that cannot be handled by slicing lines. Kitty image
+//! data is sent once and stable placements move it without flicker; other
+//! protocols re-emit the visible crop on each frame.
 
 mod overlay;
 pub mod search;
 
+use std::collections::HashSet;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -29,7 +28,7 @@ use crossterm::terminal::{
 };
 
 use crate::cli::Settings;
-use crate::images::{Store, kitty};
+use crate::images::{KittyPlacement, Store, kitty};
 use crate::markdown::Document;
 use crate::render::{Highlighter, ImageProvider, ImageRequest, Line, Screen, Span, WriteOptions};
 use crate::source::{self, Origin, Source, build_document};
@@ -46,6 +45,24 @@ const RELOAD_DEBOUNCE: Duration = Duration::from_millis(120);
 /// change; a URL has to be asked, and asking a server every few seconds is
 /// polite enough for a document someone is editing at the other end.
 const URL_POLL: Duration = Duration::from_secs(5);
+
+fn is_navigation_key(key: &KeyEvent) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Char('f') => ctrl,
+        KeyCode::Char('j' | 'k' | ' ' | 'b' | 'd' | 'u' | 'g' | 'G' | 'h' | 'l' | '0')
+        | KeyCode::Down
+        | KeyCode::Up
+        | KeyCode::Enter
+        | KeyCode::PageDown
+        | KeyCode::PageUp
+        | KeyCode::Home
+        | KeyCode::End
+        | KeyCode::Left
+        | KeyCode::Right => true,
+        _ => false,
+    }
+}
 
 /// What the pager is currently doing.
 #[derive(Debug, Clone, PartialEq)]
@@ -133,6 +150,7 @@ pub fn run(
         message: None,
         selection: 0,
         dirty: true,
+        kitty_placements: HashSet::new(),
         history: Vec::new(),
         quit: false,
     };
@@ -193,6 +211,7 @@ struct Pager<'a> {
     selection: usize,
     /// Set when the frame on screen no longer matches the state.
     dirty: bool,
+    kitty_placements: HashSet<KittyPlacement>,
     /// Documents we navigated away from, for going back.
     history: Vec<Visit>,
     quit: bool,
@@ -230,8 +249,7 @@ impl Pager<'_> {
             if event::poll(TICK)? {
                 match event::read()? {
                     Event::Key(key) => {
-                        self.on_key(key)?;
-                        self.dirty = true;
+                        self.dirty |= self.on_key(key)?;
                     }
                     Event::Mouse(mouse) => self.on_mouse(mouse)?,
                     Event::Resize(cols, rows) => {
@@ -253,29 +271,30 @@ impl Pager<'_> {
 
     // --- input ----------------------------------------------------------
 
-    fn on_key(&mut self, key: KeyEvent) -> Result<()> {
+    fn on_key(&mut self, key: KeyEvent) -> Result<bool> {
         // Terminals speaking the kitty keyboard protocol also report releases;
         // acting on those would double every keystroke.
         if key.kind == KeyEventKind::Release {
-            return Ok(());
+            return Ok(false);
         }
+        let navigation = self.mode == Mode::Normal && is_navigation_key(&key);
+        let before = (self.top, self.left, self.message.clone());
         self.message = None;
         match self.mode.clone() {
             Mode::Searching { .. } => self.on_search_key(key),
             Mode::Panel(panel) => self.on_panel_key(key, panel),
             Mode::Normal => self.on_normal_key(key),
-        }
+        }?;
+        Ok(!navigation || before != (self.top, self.left, self.message.clone()))
     }
 
     fn on_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
         match mouse.kind {
             MouseEventKind::ScrollDown => {
-                self.scroll(3);
-                self.dirty = true;
+                self.dirty |= self.scroll_changed(3);
             }
             MouseEventKind::ScrollUp => {
-                self.scroll(-3);
-                self.dirty = true;
+                self.dirty |= self.scroll_changed(-3);
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 // Taking over the mouse means taking over link clicks too.
@@ -656,8 +675,14 @@ impl Pager<'_> {
     // --- movement -------------------------------------------------------
 
     fn scroll(&mut self, delta: isize) {
+        self.scroll_changed(delta);
+    }
+
+    fn scroll_changed(&mut self, delta: isize) -> bool {
+        let before = self.top;
         let next = self.top as isize + delta;
         self.top = next.clamp(0, self.max_top() as isize) as usize;
+        self.top != before
     }
 
     /// Puts `line` near the top, leaving a little context above it.
@@ -803,15 +828,6 @@ impl Pager<'_> {
         let width = self.cols as usize;
         let height = self.viewport();
 
-        // Old placements must go before the new frame, or they linger on top of
-        // whatever scrolled into their place. Only worth saying when the
-        // document actually has pictures in it.
-        if self.settings.caps.graphics == GraphicsProtocol::Kitty
-            && self.settings.render.images
-            && self.has_images()
-        {
-            out.push_str(kitty::clear_all());
-        }
         out.push_str("\x1b[H");
 
         let mut writer = StyleWriter::new(self.settings.caps.color)
@@ -846,9 +862,18 @@ impl Pager<'_> {
             writer.reset(&mut out);
         }
 
-        if self.settings.render.images && self.has_images() {
-            self.draw_images(&mut out, height);
+        let placements = if self.settings.render.images
+            && self.has_images()
+            && !matches!(self.mode, Mode::Panel(_))
+        {
+            self.draw_images(&mut out, height)
+        } else {
+            HashSet::new()
+        };
+        for stale in self.kitty_placements.difference(&placements) {
+            out.push_str(&kitty::delete_placement(stale.image_id, stale.placement_id));
         }
+        self.kitty_placements = placements;
         self.draw_status(&mut out, &mut writer, width, height);
 
         if let Mode::Panel(panel) = self.mode {
@@ -880,9 +905,9 @@ impl Pager<'_> {
     }
 
     /// Draws every image that intersects the viewport, cropped to fit.
-    fn draw_images(&mut self, out: &mut String, height: usize) {
+    fn draw_images(&mut self, out: &mut String, height: usize) -> HashSet<KittyPlacement> {
         // Collect first: encoding borrows the store mutably.
-        let mut requests: Vec<(usize, crate::render::ImagePlacement, u16, u16)> = Vec::new();
+        let mut requests: Vec<(usize, usize, crate::render::ImagePlacement, u16, u16)> = Vec::new();
         for (index, line) in self.screen.lines.iter().enumerate() {
             let Some(placement) = &line.image else {
                 continue;
@@ -898,6 +923,7 @@ impl Pager<'_> {
             let space = height - screen_row;
             let skip_bottom = remaining.saturating_sub(space);
             requests.push((
+                index,
                 screen_row,
                 placement.clone(),
                 skip_top as u16,
@@ -905,7 +931,8 @@ impl Pager<'_> {
             ));
         }
 
-        for (screen_row, placement, skip_top, skip_bottom) in requests {
+        let mut placements = HashSet::new();
+        for (index, screen_row, placement, skip_top, skip_bottom) in requests {
             // Horizontal scrolling moves images with the text; once the indent
             // is off-screen there is nothing sensible to draw.
             let Some(column) = (placement.indent as usize).checked_sub(self.left) else {
@@ -922,11 +949,19 @@ impl Pager<'_> {
             if request.visible_rows() == 0 {
                 continue;
             }
-            if let Some(sequence) = self.store.encode(request) {
+            if self.store.protocol() == GraphicsProtocol::Kitty {
+                let placement_id = u32::try_from(index + 1).unwrap_or(u32::MAX);
+                if let Some(draw) = self.store.kitty_place(request, placement_id) {
+                    out.push_str(&format!("\x1b[{};{}H", screen_row + 1, column + 1));
+                    out.push_str(&draw.sequence);
+                    placements.insert(draw.placement);
+                }
+            } else if let Some(sequence) = self.store.encode(request) {
                 out.push_str(&format!("\x1b[{};{}H", screen_row + 1, column + 1));
                 out.push_str(&sequence);
             }
         }
+        placements
     }
 
     fn draw_status(&self, out: &mut String, writer: &mut StyleWriter, width: usize, height: usize) {
@@ -1324,6 +1359,7 @@ mod tests {
             message: None,
             selection: 0,
             dirty: true,
+            kitty_placements: HashSet::new(),
             history: Vec::new(),
             quit: false,
         }
@@ -1871,8 +1907,22 @@ mod tests {
         let mut p = pager(100, 25);
         let mut key = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
         key.kind = KeyEventKind::Release;
-        p.on_key(key).unwrap();
+        assert!(!p.on_key(key).unwrap());
         assert_eq!(p.top, 0, "a release must not scroll");
+    }
+
+    #[test]
+    fn scrolling_past_an_edge_does_not_redraw() {
+        let mut p = pager(100, 25);
+        assert!(
+            !p.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+                .unwrap()
+        );
+        p.top = p.max_top();
+        assert!(
+            !p.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+                .unwrap()
+        );
     }
 
     #[test]
